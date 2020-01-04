@@ -1,0 +1,244 @@
+/*
+****** PINOUTS ******
+    BUTTONS
+  CRUISE_STALK on GND and A0
+    CAN BOARD
+  INT to pin 2
+  SCK to pin 13
+  MOSI to pin 11
+  MISO to pin 12
+
+  CAN tranciever code credit
+  Copyright (c) Sandeep Mistry. All rights reserved.
+  Licensed under the MIT license. See LICENSE file in the project root for full license information.
+  
+ * notes on my setup:
+ * CANCEL is always above 50
+ * SET can vary between 30 and 50+
+ * MAIN_ON can vary between 14 and 50+, sometimes 14, 27, 38... mostly 14 
+ * ACC is usually 20 but can hit 40 if spammed
+ */
+#define BUTTON_UNPRESS_THRES 60U // when a button is released, there is a spike. so set this slightly above the max value
+#define CAN_OUTPUT 0x151
+#define CAN_INPUT 0x150
+#define COUNTER_CYCLE 0xFU
+
+#define DEBUG
+
+#include <CAN.h>
+// Variables for button presses
+int button_state_last = 0;
+
+// cruise_flags
+bool button_pressed = 0;
+bool button_unpressed = 0;
+bool process_button = 0;
+bool main_on = 0;
+bool speed_set = 0;
+bool engaged = 0;
+
+bool sendcan = 0;
+
+void setup() {
+  #ifdef DEBUG:
+    Serial.begin(500000);
+    while (!Serial);
+  #endif
+  Serial.println("CAN Sender");
+
+  // start the CAN bus at 500 kbps
+  if (!CAN.begin(500E3)) {
+    Serial.println("Starting CAN failed!");
+    while (1);
+  }
+
+  // setup pins
+  pinMode(A0, INPUT_PULLUP);
+  int nothing = analogRead(A0);
+
+  // so apparently this exists http://www.8bit-era.cz/arduino-timer-interrupts-calculator.html
+  
+  // TIMER 1 for interrupt frequency 100 Hz:
+  cli(); // stop interrupts
+  TCCR1A = 0; // set entire TCCR1A register to 0
+  TCCR1B = 0; // same for TCCR1B
+  TCNT1  = 0; // initialize counter value to 0
+  // set compare match register for 100 Hz increments
+  OCR1A = 19999; // = 16000000 / (8 * 100) - 1 (must be <65536)
+  // turn on CTC mode
+  TCCR1B |= (1 << WGM12);
+  // Set CS12, CS11 and CS10 bits for 8 prescaler
+  TCCR1B |= (0 << CS12) | (1 << CS11) | (0 << CS10);
+  // enable timer compare interrupt
+  TIMSK1 |= (1 << OCIE1A);
+  sei(); // allow interrupts
+  
+}
+
+unsigned int pkt_idx = 0;
+
+void loop() {
+    // these values are reset when not pressing the button
+  bool RES_ACC = 0;
+  bool SET_COAST = 0;
+  bool NEW_SETPOINT = 0;
+  
+  // read the stalk
+  int button_state = analogRead(A0);
+  button_pressed = button_state < BUTTON_UNPRESS_THRES;
+  button_unpressed = button_state > BUTTON_UNPRESS_THRES;
+
+  // obey PCM Cancel Command
+  CAN.parsePacket();
+  if (CAN.packetId() == 0x150) {
+    uint8_t dat2[8];
+    for (int ii = 0; ii <= 7; ii++) {
+      dat2[ii]  = (char)CAN.read();
+    }
+    if (pedal_checksum(dat2, 5) == dat2[5]){
+      if ((dat2[0]) != 0) {
+        engaged = false;
+        Serial.println("CANCEL!");
+      }
+    }
+  }
+  
+  if(button_pressed){
+    // set the historic value for the button
+    process_button = 1;
+    button_state_last = button_state;
+    switch(button_state){
+      case 18 ... 25:
+        // RES_ACC
+        if(engaged){
+          // ACC
+          RES_ACC = 1;
+        }
+        break;
+      case 27 ... 40:
+        // SET/COAST
+        if(engaged){
+          // COAST
+          SET_COAST = 1;
+        }
+        if(!engaged){
+          NEW_SETPOINT = 1;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  if(button_unpressed){
+    // do our logic on the falling edge
+    // Serial.println(button_state_last);
+    if (process_button){
+      switch(button_state_last){
+        case 10 ... 17:
+          // MAIN_ON
+          main_on = !main_on;
+          break;
+        case 20 ... 25:
+          // RES_ACC
+          if(speed_set){
+            if(!engaged){
+              engaged = 1;
+            }
+          }
+          break;
+        case 27 ... 40:
+          // SET_COAST
+          if(main_on){
+            if(!engaged){
+              engaged = 1;
+              if (speed_set){
+                // we want to set a new speed (maybe user pressed CANCEL and wants to set a new speed)
+                NEW_SETPOINT = 1;
+              }
+              // SPEED_SET so we know it's been engaged before
+              speed_set = 1;
+            }
+          }
+          break;
+        case 54 ... 60:
+          // CANCEL
+          // disengage but keep the set speed.
+          engaged = 0;
+          break;
+        default:
+          break;
+      }
+      process_button = 0;
+    }
+  }
+
+  //reset all the states if cruise is off
+  if(!main_on){
+    speed_set = 0;
+    engaged = 0;
+  }
+
+  // THINGS WE NEED TO SEND TO EON:
+  // MAIN_ON
+  // SPEED_SET
+  // ENGAGED
+  // ACC
+  // COAST
+
+  while(sendcan){
+    // make and send the can message. this actually does not run at 100hz
+    uint8_t dat[8];
+    dat[0] = main_on << 7 | speed_set << 6 | NEW_SETPOINT << 5 | engaged << 4 | RES_ACC << 3 | SET_COAST << 2;
+    dat[1] = 0x0;
+    dat[2] = 0x0;
+    dat[3] = 0x0;
+    dat[4] = ((0x0 & 0xFU) << 4) | pkt_idx;;
+    dat[5] = pedal_checksum(dat, 5);
+    CAN.beginPacket(CAN_OUTPUT);
+    for (int ii = 0; ii < 6; ii++) {
+      CAN.write(dat[ii]);
+    }
+    CAN.endPacket();
+    ++pkt_idx;
+    pkt_idx &= COUNTER_CYCLE;
+    sendcan = 0;
+  }
+  
+  #ifdef DEBUG
+    Serial.print(" MAIN_ON: ");
+    Serial.print(main_on);
+    Serial.print(" ENGAGED: ");
+    Serial.print(engaged);
+    Serial.print(" SPEED_SET: ");
+    Serial.print(speed_set);
+    Serial.print(" INC/DEC: ");
+    Serial.print(RES_ACC);
+    Serial.println(SET_COAST);
+  #endif
+}
+
+ISR(TIMER1_COMPA_vect){
+   //interrupt commands for TIMER 1 here
+  sendcan = 1;
+}
+
+// ***************************** pedal can checksum *****************************
+
+uint8_t pedal_checksum(uint8_t *dat, int len) {
+  uint8_t crc = 0xFF;
+  uint8_t poly = 0xD5; // standard crc8
+  int i, j;
+  for (i = len - 1; i >= 0; i--) {
+    crc ^= dat[i];
+    for (j = 0; j < 8; j++) {
+      if ((crc & 0x80U) != 0U) {
+        crc = (uint8_t)((crc << 1) ^ poly);
+      }
+      else {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
